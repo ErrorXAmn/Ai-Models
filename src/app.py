@@ -1,22 +1,12 @@
-"""
-Veyra AI — Cloudflare Python Worker
-Flask API
-"""
-
 import json
-from pyodide.ffi import run_sync
-import aiohttp
-
-from flask import Flask, jsonify, request, Response
-from flask_cors import CORS
+from flask import Flask, request, Response
 from workers import wsgi
+from js import fetch
+from pyodide.ffi import run_sync
 
+app = Flask(__name__)
 
-APP_NAME = "Veyra AI"
-TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
-
-# Set this in Cloudflare as a Secret named API_KEY.
-API_KEY = None
+UPSTREAM_URL = "https://tokenharbor.ai/v1/chat/completions"
 
 MODELS = {
     "deepseek-v4-flash": "deepseek-v4-flash:free",
@@ -26,285 +16,214 @@ MODELS = {
     "mimo-v2-5": "mimo-v2.5:free",
 }
 
-DEFAULT_MODEL = "deepseek-v4-flash"
-TIMEOUT = 60
-RETRIES = 2
+
+# -------------------------
+# CORS
+# -------------------------
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 
-app = Flask(APP_NAME.lower().replace(" ", "-"))
-CORS(app)
-
-
-def get_api_key():
-    """
-    Get API_KEY from Cloudflare Worker environment.
-    Flask WSGI exposes Worker bindings through request.environ.
-    """
-    try:
-        env = request.environ.get("workers.env")
-
-        if env is not None:
-            key = getattr(env, "API_KEY", None)
-
-            if key:
-                return str(key)
-
-    except Exception:
-        pass
-
-    return None
-
-
-async def upstream_request(
-    model_id,
-    messages,
-    api_key,
-    temperature=None,
-    max_tokens=None,
-    stream=False,
-):
-    payload = {
-        "model": model_id,
-        "messages": messages,
-        "stream": stream,
+@app.route("/", methods=["GET"])
+def home():
+    return {
+        "status": "online",
+        "name": "Ai-Models API",
+        "version": "1.0.0",
+        "endpoints": {
+            "models": "/v1/models",
+            "chat": "/v1/chat",
+            "model_chat": "/v1/chat/<model>"
+        }
     }
 
-    if temperature is not None:
-        payload["temperature"] = temperature
 
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
+# -------------------------
+# Models
+# -------------------------
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
-
-    last_error = None
-
-    for attempt in range(RETRIES):
-        try:
-            async with aiohttp.ClientSession(
-                timeout=timeout
-            ) as session:
-
-                async with session.post(
-                    TOKENHARBOR_URL,
-                    headers=headers,
-                    json=payload,
-                ) as response:
-
-                    status = response.status
-                    body = await response.read()
-
-                    if (
-                        status in (429, 500, 502, 503, 504)
-                        and attempt < RETRIES - 1
-                    ):
-                        last_error = RuntimeError(
-                            f"upstream {status}"
-                        )
-                        continue
-
-                    return status, body
-
-        except Exception as exc:
-            last_error = exc
-
-    raise last_error or RuntimeError("upstream failed")
-
-
-def call_upstream(
-    model_id,
-    messages,
-    temperature=None,
-    max_tokens=None,
-    stream=False,
-):
-    api_key = get_api_key()
-
-    if not api_key:
-        raise RuntimeError(
-            "API_KEY secret is not configured in Cloudflare."
-        )
-
-    return run_sync(
-        upstream_request(
-            model_id=model_id,
-            messages=messages,
-            api_key=api_key,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=stream,
-        )
-    )
-
-
-def error(message, code, status):
-    return jsonify(
-        {
-            "error": {
-                "message": message,
-                "code": code,
-            }
-        }
-    ), status
-
-
-@app.get("/")
-def index():
-    return jsonify(
-        {
-            "name": APP_NAME,
-            "version": "1.0",
-            "status": "online",
-            "docs": {
-                "models": "GET /v1/models",
-                "chat": (
-                    "POST /v1/chat/<model> "
-                    'body: {"prompt": "..."}'
-                ),
-                "chat_universal": (
-                    "POST /v1/chat "
-                    'body: {"model": "...", "prompt": "..."}'
-                ),
-            },
-            "models": list(MODELS.keys()),
-        }
-    )
-
-
-@app.get("/v1/models")
+@app.route("/v1/models", methods=["GET"])
 def models():
-    return jsonify(
-        {
-            "object": "list",
-            "data": [
-                {
-                    "id": slug,
-                    "upstream": upstream,
-                    "endpoint": f"/v1/chat/{slug}",
-                }
-                for slug, upstream in MODELS.items()
-            ],
-        }
-    )
+    data = []
+
+    for model_id, upstream_model in MODELS.items():
+        data.append({
+            "id": model_id,
+            "object": "model",
+            "owned_by": "ai-models",
+            "upstream_model": upstream_model
+        })
+
+    return {
+        "object": "list",
+        "data": data
+    }
 
 
-@app.post("/v1/chat")
-def chat_universal():
-    body = request.get_json(silent=True) or {}
+# -------------------------
+# Upstream request
+# -------------------------
 
-    slug = (
-        body.get("model")
-        or DEFAULT_MODEL
-    ).strip()
+def call_upstream(payload, api_key):
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
 
-    return _chat(slug, body)
+    options = {
+        "method": "POST",
+        "headers": headers,
+        "body": json.dumps(payload),
+    }
 
+    try:
+        js_response = run_sync(fetch(UPSTREAM_URL, options))
 
-@app.post("/v1/chat/<slug>")
-def chat_by_model(slug):
-    body = request.get_json(silent=True) or {}
+        status = int(js_response.status)
+        text = run_sync(js_response.text())
 
-    return _chat(slug, body)
+        return status, text
 
-
-def _chat(slug, body):
-    model_id = MODELS.get(slug)
-
-    if not model_id:
-        return error(
-            f"Unknown model '{slug}'. "
-            f"Valid: {', '.join(MODELS)}",
-            "unknown_model",
-            404,
-        )
-
-    # prompt > input > messages
-    prompt = body.get("prompt") or body.get("input")
-    messages = body.get("messages") or []
-
-    if not messages:
-
-        if not prompt or not str(prompt).strip():
-            return error(
-                'Provide "prompt" (string) '
-                'or "messages" list.',
-                "missing_prompt",
-                400,
-            )
-
-        messages = [
-            {
-                "role": "user",
-                "content": str(prompt),
+    except Exception as e:
+        return 502, json.dumps({
+            "error": {
+                "message": f"Upstream request failed: {str(e)}",
+                "type": "upstream_error"
             }
-        ]
+        })
 
+
+# -------------------------
+# Chat API
+# -------------------------
+
+@app.route("/v1/chat", methods=["POST", "OPTIONS"])
+def chat():
+    if request.method == "OPTIONS":
+        return Response(status=204)
+
+    body = request.get_json(silent=True)
+
+    if not body:
+        return {
+            "error": {
+                "message": "Request body must be valid JSON",
+                "type": "invalid_request_error"
+            }
+        }, 400
+
+    model = body.get("model")
+
+    if not model:
+        return {
+            "error": {
+                "message": "Missing required field: model",
+                "type": "invalid_request_error"
+            }
+        }, 400
+
+    if model not in MODELS:
+        return {
+            "error": {
+                "message": f"Unknown model: {model}",
+                "type": "invalid_request_error",
+                "available_models": list(MODELS.keys())
+            }
+        }, 400
+
+    # Convert public model name to upstream model name
+    payload = dict(body)
+    payload["model"] = MODELS[model]
+
+    # Get Cloudflare Secret
     try:
-        status, raw_body = call_upstream(
-            model_id=model_id,
-            messages=messages,
-            temperature=body.get("temperature"),
-            max_tokens=body.get("max_tokens"),
-            stream=bool(body.get("stream")),
-        )
-
-    except Exception as exc:
-        return error(
-            f"Upstream failed: {exc}",
-            "upstream_error",
-            502,
-        )
-
-    # Streaming/SSE passthrough
-    if body.get("stream") and 200 <= status < 300:
-        return Response(
-            raw_body,
-            status=status,
-            content_type="text/event-stream",
-        )
-
-    try:
-        data = json.loads(
-            raw_body.decode("utf-8")
-        )
-
+        env = request.environ["workers.env"]
+        api_key = env.UPSTREAM_API_KEY
     except Exception:
-        return error(
-            f"Upstream returned non-JSON "
-            f"(HTTP {status}).",
-            "upstream_error",
-            502,
+        return {
+            "error": {
+                "message": "UPSTREAM_API_KEY secret is not configured",
+                "type": "configuration_error"
+            }
+        }, 500
+
+    status, upstream_text = call_upstream(payload, api_key)
+
+    # Preserve upstream response
+    content_type = "application/json"
+
+    if status >= 400:
+        return Response(
+            upstream_text,
+            status=status,
+            content_type=content_type
         )
 
-    if not 200 <= status < 300:
-        return jsonify(data), status
-
-    choices = data.get("choices") or []
-
-    content = ""
-
-    if choices:
-        message = choices[0].get("message") or {}
-        content = message.get("content", "")
-
-    return jsonify(
-        {
-            "model": slug,
-            "upstream": data.get(
-                "model",
-                model_id,
-            ),
-            "content": content,
-            "choices": data.get("choices"),
-            "usage": data.get("usage"),
-        }
+    return Response(
+        upstream_text,
+        status=status,
+        content_type=content_type
     )
 
 
-# Cloudflare Python Worker entrypoint.
+# -------------------------
+# Model-specific Chat API
+# -------------------------
+
+@app.route("/v1/chat/<model>", methods=["POST", "OPTIONS"])
+def model_chat(model):
+    if request.method == "OPTIONS":
+        return Response(status=204)
+
+    if model not in MODELS:
+        return {
+            "error": {
+                "message": f"Unknown model: {model}",
+                "type": "invalid_request_error",
+                "available_models": list(MODELS.keys())
+            }
+        }, 400
+
+    body = request.get_json(silent=True)
+
+    if not body:
+        return {
+            "error": {
+                "message": "Request body must be valid JSON",
+                "type": "invalid_request_error"
+            }
+        }, 400
+
+    payload = dict(body)
+    payload["model"] = MODELS[model]
+
+    try:
+        env = request.environ["workers.env"]
+        api_key = env.UPSTREAM_API_KEY
+    except Exception:
+        return {
+            "error": {
+                "message": "UPSTREAM_API_KEY secret is not configured",
+                "type": "configuration_error"
+            }
+        }, 500
+
+    status, upstream_text = call_upstream(payload, api_key)
+
+    return Response(
+        upstream_text,
+        status=status,
+        content_type="application/json"
+    )
+
+
+# -------------------------
+# Cloudflare Worker entry
+# -------------------------
+
 Default = wsgi.entrypoint(app)
