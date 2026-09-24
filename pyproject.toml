@@ -1,11 +1,13 @@
 [project]
 name = "ai-models"
 version = "1.0.0"
+description = "Veyra AI Flask API on Cloudflare Workers"
 requires-python = ">=3.13"
+
 dependencies = [
     "flask",
     "flask-cors",
-    "httpx2"
+    "aiohttp"
 ]
 
 [dependency-groups]
